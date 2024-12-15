@@ -50,6 +50,12 @@ interface MessagePayload {
     };
 }
 
+interface SrcRouteIndPayload {
+    dstaddr: number;
+    relaycount: number;
+    relaylist: number[];
+}
+
 export {
     MessagePayload,
     MessagePayloadType,
@@ -60,4 +66,5 @@ export {
     PermitJoinChangedPayload,
     DeviceNetworkAddressChangedPayload,
     LastSeenChangedPayload,
+    SrcRouteIndPayload,
 };

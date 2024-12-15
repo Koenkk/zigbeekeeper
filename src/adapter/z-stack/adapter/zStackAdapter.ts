@@ -795,6 +795,8 @@ class ZStackAdapter extends Adapter {
                 };
 
                 this.emit('deviceJoined', payload);
+            } else if (object.command.name === 'srcRtgInd') {
+                this.emit('sourceRoute', object.payload);
             } else if (object.command.name === 'endDeviceAnnceInd') {
                 // TODO: better way???
                 /* istanbul ignore else */

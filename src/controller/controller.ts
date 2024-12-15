@@ -62,6 +62,7 @@ export interface ControllerEventMap {
     deviceLeave: [data: Events.DeviceLeavePayload];
     permitJoinChanged: [data: Events.PermitJoinChangedPayload];
     lastSeenChanged: [data: Events.LastSeenChangedPayload];
+    sourceRoute: [data: Events.SrcRouteIndPayload];
 }
 
 /**
@@ -165,6 +166,7 @@ class Controller extends events.EventEmitter<ControllerEventMap> {
         this.adapter.on('zdoResponse', this.onZdoResponse.bind(this));
         this.adapter.on('disconnected', this.onAdapterDisconnected.bind(this));
         this.adapter.on('deviceLeave', this.onDeviceLeave.bind(this));
+        this.adapter.on('sourceRoute', this.onSourceRoute.bind(this));
 
         if (startResult === 'reset') {
             /* istanbul ignore else */
@@ -957,6 +959,10 @@ class Controller extends events.EventEmitter<ControllerEventMap> {
         if (frame) {
             await device.onZclData(payload, frame, endpoint);
         }
+    }
+
+    private onSourceRoute(data: Events.SrcRouteIndPayload): void {
+        this.emit('sourceRoute', data);
     }
 }
 
