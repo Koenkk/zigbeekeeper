@@ -85,5 +85,5 @@
         "clean": "rimraf temp coverage dist tsconfig.tsbuildinfo",
         "prepack": "pnpm run clean && pnpm run build"
     },
-    "version": "3.2.1"
+    "version": "3.2.2"
 }
