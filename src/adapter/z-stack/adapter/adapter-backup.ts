@@ -1,8 +1,6 @@
 import assert from 'node:assert';
-import * as fs from 'node:fs';
 
 import * as Models from '../../../models';
-import {BackupUtils} from '../../../utils';
 import {logger} from '../../../utils/logger';
 import {NULL_NODE_ID, Utils as ZSpecUtils} from '../../../zspec';
 import {NvItemsIds, NvSystemIds} from '../constants/common';
@@ -31,36 +29,9 @@ export class AdapterBackup {
     }
 
     /**
-     * Loads currently stored backup and returns it in internal backup model.
-     */
-    public async getStoredBackup(): Promise<Models.Backup | undefined> {
-        try {
-            fs.accessSync(this.defaultPath);
-        } catch {
-            return undefined;
-        }
-        let data;
-        try {
-            data = JSON.parse(fs.readFileSync(this.defaultPath).toString());
-        } catch (error) {
-            throw new Error(`Coordinator backup is corrupted (${error})`);
-        }
-        if (data.metadata?.format === 'zigpy/open-coordinator-backup' && data.metadata?.version) {
-            if (data.metadata?.version !== 1) {
-                throw new Error(`Unsupported open coordinator backup version (version=${data.metadata?.version})`);
-            }
-            return BackupUtils.fromUnifiedBackup(data as Models.UnifiedBackupStorage);
-        } else if (data.adapterType === 'zStack') {
-            return BackupUtils.fromLegacyBackup(data as Models.LegacyBackupStorage);
-        } else {
-            throw new Error('Unknown backup format');
-        }
-    }
-
-    /**
      * Creates a new backup from connected ZNP adapter and returns it in internal backup model format.
      */
-    public async createBackup(ieeeAddressesInDatabase: string[]): Promise<Models.Backup> {
+    public async createBackup(ieeeAddressesInDatabase: string[], getExistingBackup: () => Models.Backup | undefined): Promise<Models.Backup> {
         logger.debug('creating backup', NS);
         const version: ZnpVersion = await this.getAdapterVersion();
 
@@ -227,7 +198,7 @@ export class AdapterBackup {
              * does not have the linkKey anymore.
              * Below we don't remove any devices from the backup which have a linkkey and are still in the database (=ieeeAddressesInDatabase)
              */
-            const oldBackup = await this.getStoredBackup();
+            const oldBackup = getExistingBackup();
             assert(oldBackup, "Old backup doesn't exist");
             const missing = oldBackup.devices.filter(
                 (d) =>

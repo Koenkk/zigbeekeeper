@@ -2,8 +2,6 @@
 
 import {EventEmitter} from 'node:events';
 
-import equals from 'fast-deep-equal/es6';
-
 import {wait, Waitress} from '../../../utils';
 import {logger} from '../../../utils/logger';
 import * as ZSpec from '../../../zspec';
@@ -15,15 +13,12 @@ import * as TsType from './../../tstype';
 import {ParamsDesc} from './commands';
 import {Ezsp, EZSPFrameData} from './ezsp';
 import {Multicast} from './multicast';
-import {EmberApsOption, EmberJoinDecision, EmberKeyData, EmberNodeType, EmberStatus, uint8_t, uint16_t} from './types';
+import {EmberApsOption, EmberJoinDecision, EmberKeyData, EmberStatus, uint8_t, uint16_t} from './types';
 import {
     EmberDerivedKeyType,
     EmberDeviceUpdate,
     EmberEUI64,
-    EmberInitialSecurityBitmask,
-    EmberJoinMethod,
     EmberKeyType,
-    EmberNetworkStatus,
     EmberOutgoingMessageType,
     EmberStackError,
     EzspDecisionBitmask,
@@ -35,13 +30,10 @@ import {
     EmberAesMmoHashContext,
     EmberApsFrame,
     EmberIeeeRawFrame,
-    EmberInitialSecurityState,
-    EmberKeyStruct,
     EmberNetworkParameters,
     EmberRawFrame,
     EmberSecurityManagerContext,
 } from './types/struct';
-import {ember_security} from './utils';
 
 const NS = 'zh:ezsp:driv';
 
@@ -94,13 +86,9 @@ const DEFAULT_MFG_ID = 0x1049;
 const REQUEST_ATTEMPT_DELAYS = [500, 1000, 1500];
 
 export class Driver extends EventEmitter {
-    // @ts-expect-error XXX: init in startup
-    public ezsp: Ezsp;
-    private nwkOpt: TsType.NetworkOptions;
-    // @ts-expect-error XXX: init in startup
-    public networkParams: EmberNetworkParameters;
-    // @ts-expect-error XXX: init in startup
-    public version: {
+    public ezsp!: Ezsp;
+    public networkParams!: EmberNetworkParameters;
+    public version!: {
         product: number;
         majorrel: string;
         minorrel: string;
@@ -109,22 +97,21 @@ export class Driver extends EventEmitter {
     };
     private eui64ToNodeId = new Map<string, number>();
     // private eui64ToRelays = new Map<string, number>();
-    // @ts-expect-error XXX: init in startup
-    public ieee: EmberEUI64;
-    // @ts-expect-error XXX: init in startup
-    private multicast: Multicast;
+    public ieee!: EmberEUI64;
+    private multicast!: Multicast;
     private waitress: Waitress<EmberFrame, EmberWaitressMatcher>;
     private transactionID = 1;
     private serialOpt: TsType.SerialPortOptions;
     public backupMan: EZSPAdapterBackup;
+    private initNetwork: () => Promise<TsType.StartResult>;
 
-    constructor(serialOpt: TsType.SerialPortOptions, nwkOpt: TsType.NetworkOptions, backupPath: string) {
+    constructor(serialOpt: TsType.SerialPortOptions, backupPath: string, initNetwork: () => Promise<TsType.StartResult>) {
         super();
 
-        this.nwkOpt = nwkOpt;
         this.serialOpt = serialOpt;
         this.waitress = new Waitress<EmberFrame, EmberWaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
         this.backupMan = new EZSPAdapterBackup(this, backupPath);
+        this.initNetwork = initNetwork;
     }
 
     /**
@@ -175,10 +162,8 @@ export class Driver extends EventEmitter {
         }
     }
 
-    public async startup(transmitPower?: number): Promise<TsType.StartResult> {
-        let result: TsType.StartResult = 'resumed';
+    public async startup(): Promise<TsType.StartResult> {
         this.transactionID = 1;
-        // this.ezsp = undefined;
         this.ezsp = new Ezsp();
         this.ezsp.on('close', this.onEzspClose.bind(this));
 
@@ -239,37 +224,7 @@ export class Driver extends EventEmitter {
             revision: vers,
         };
 
-        if (await this.needsToBeInitialised(this.nwkOpt)) {
-            // need to check the backup
-            const restore = await this.needsToBeRestore(this.nwkOpt);
-
-            const res = await this.ezsp.execCommand('networkState');
-
-            logger.debug(`Network state ${res.status}`, NS);
-
-            if (res.status == EmberNetworkStatus.JOINED_NETWORK) {
-                logger.info(`Leaving current network and forming new network`, NS);
-
-                const st = await this.ezsp.leaveNetwork();
-
-                if (st != EmberStatus.NETWORK_DOWN) {
-                    logger.error(`leaveNetwork returned unexpected status: ${st}`, NS);
-                }
-            }
-
-            if (restore) {
-                // restore
-                logger.info('Restore network from backup', NS);
-                await this.formNetwork(true, transmitPower);
-                result = 'restored';
-            } else {
-                // reset
-                logger.info('Form network', NS);
-                await this.formNetwork(false, transmitPower);
-                result = 'reset';
-            }
-        }
-
+        const result = await this.initNetwork();
         const state = (await this.ezsp.execCommand('networkState')).status;
         logger.debug(`Network state ${state}`, NS);
 
@@ -301,69 +256,7 @@ export class Driver extends EventEmitter {
         await this.multicast.subscribe(ZSpec.GP_GROUP_ID, ZSpec.GP_ENDPOINT);
         // await this.multicast.subscribe(1, 901);
 
-        if (transmitPower != undefined && this.networkParams.radioTxPower !== transmitPower) {
-            await this.ezsp.execCommand('setRadioPower', {power: transmitPower});
-        }
-
         return result;
-    }
-
-    private async needsToBeInitialised(options: TsType.NetworkOptions): Promise<boolean> {
-        let valid = true;
-        valid = valid && (await this.ezsp.networkInit());
-        const netParams = await this.ezsp.execCommand('getNetworkParameters');
-        const networkParams = netParams.parameters;
-        logger.debug(`Current Node type: ${netParams.nodeType}, Network parameters: ${networkParams}`, NS);
-        valid = valid && netParams.status == EmberStatus.SUCCESS;
-        valid = valid && netParams.nodeType == EmberNodeType.COORDINATOR;
-        valid = valid && options.panID == networkParams.panId;
-        valid = valid && options.channelList.includes(networkParams.radioChannel);
-        valid = valid && equals(options.extendedPanID, networkParams.extendedPanId);
-        return !valid;
-    }
-
-    private async formNetwork(restore: boolean, transmitPower?: number): Promise<void> {
-        let backup;
-        await this.ezsp.execCommand('clearTransientLinkKeys');
-
-        let initial_security_state: EmberInitialSecurityState;
-        if (restore) {
-            backup = await this.backupMan.getStoredBackup();
-
-            if (!backup) {
-                throw new Error(`No valid backup found.`);
-            }
-
-            initial_security_state = ember_security(backup.networkOptions.networkKey);
-            initial_security_state.bitmask |= EmberInitialSecurityBitmask.NO_FRAME_COUNTER_RESET;
-            initial_security_state.networkKeySequenceNumber = backup.networkKeyInfo.sequenceNumber;
-            initial_security_state.preconfiguredKey.contents = backup.ezsp!.hashed_tclk!;
-        } else {
-            await this.ezsp.execCommand('clearKeyTable');
-            initial_security_state = ember_security(Buffer.from(this.nwkOpt.networkKey!));
-        }
-        await this.ezsp.setInitialSecurityState(initial_security_state);
-
-        const parameters: EmberNetworkParameters = new EmberNetworkParameters();
-        parameters.radioTxPower = transmitPower ?? 5;
-        parameters.joinMethod = EmberJoinMethod.USE_MAC_ASSOCIATION;
-        parameters.nwkManagerId = 0;
-        parameters.nwkUpdateId = 0;
-        parameters.channels = 0x07fff800; // all channels
-        if (restore) {
-            // `backup` valid from above
-            parameters.panId = backup!.networkOptions.panId;
-            parameters.extendedPanId = backup!.networkOptions.extendedPanId;
-            parameters.radioChannel = backup!.logicalChannel;
-            parameters.nwkUpdateId = backup!.networkUpdateId;
-        } else {
-            parameters.radioChannel = this.nwkOpt.channelList[0];
-            parameters.panId = this.nwkOpt.panID;
-            parameters.extendedPanId = Buffer.from(this.nwkOpt.extendedPanID!);
-        }
-
-        await this.ezsp.formNetwork(parameters);
-        await this.ezsp.setValue(EzspValueId.VALUE_STACK_TOKEN_WRITING, 1);
     }
 
     private handleFrame(frameName: string, frame: EZSPFrameData): void {
@@ -935,60 +828,5 @@ export class Driver extends EventEmitter {
 
             return keyInfo;
         }
-    }
-
-    private async needsToBeRestore(options: TsType.NetworkOptions): Promise<boolean> {
-        // if no backup and the settings have been changed, then need to start a new network
-        const backup = await this.backupMan.getStoredBackup();
-        if (!backup) return false;
-
-        let valid = true;
-        //valid = valid && (await this.ezsp.networkInit());
-        const netParams = await this.ezsp.execCommand('getNetworkParameters');
-        const networkParams = netParams.parameters;
-        logger.debug(`Current Node type: ${netParams.nodeType}, Network parameters: ${networkParams}`, NS);
-        logger.debug(`Backuped network parameters: ${backup.networkOptions}`, NS);
-        const networkKey = await this.getKey(EmberKeyType.CURRENT_NETWORK_KEY);
-        let netKey: Buffer;
-
-        if (this.ezsp.ezspV < 13) {
-            netKey = Buffer.from((networkKey.keyStruct as EmberKeyStruct).key.contents);
-        } else {
-            netKey = Buffer.from((networkKey.keyData as EmberKeyData).contents);
-        }
-
-        // if the settings in the backup match the chip, then need to warn to delete the backup file first
-        valid = valid && networkParams.panId == backup.networkOptions.panId;
-        valid = valid && networkParams.radioChannel == backup.logicalChannel;
-        valid = valid && Buffer.from(networkParams.extendedPanId).equals(backup.networkOptions.extendedPanId);
-        valid = valid && Buffer.from(netKey).equals(backup.networkOptions.networkKey);
-        if (valid) {
-            logger.error(`Configuration is not consistent with adapter backup!`, NS);
-            logger.error(`- PAN ID: configured=${options.panID}, adapter=${networkParams.panId}, backup=${backup.networkOptions.panId}`, NS);
-            logger.error(
-                `- Extended PAN ID: configured=${Buffer.from(options.extendedPanID!).toString('hex')}, ` +
-                    `adapter=${Buffer.from(networkParams.extendedPanId).toString('hex')}, ` +
-                    `backup=${Buffer.from(networkParams.extendedPanId).toString('hex')}`,
-                NS,
-            );
-            logger.error(`- Channel: configured=${options.channelList}, adapter=${networkParams.radioChannel}, backup=${backup.logicalChannel}`, NS);
-            logger.error(
-                `- Network key: configured=${Buffer.from(options.networkKey!).toString('hex')}, ` +
-                    `adapter=${Buffer.from(netKey).toString('hex')}, ` +
-                    `backup=${backup.networkOptions.networkKey.toString('hex')}`,
-                NS,
-            );
-            logger.error(`Please update configuration to prevent further issues.`, NS);
-            logger.error(`If you wish to re-commission your network, please remove coordinator backup.`, NS);
-            logger.error(`Re-commissioning your network will require re-pairing of all devices!`, NS);
-            throw new Error('startup failed - configuration-adapter mismatch - see logs above for more information');
-        }
-        valid = true;
-        // if the settings in the backup match the config, then the old network is in the chip and needs to be restored
-        valid = valid && options.panID == backup.networkOptions.panId;
-        valid = valid && options.channelList.includes(backup.logicalChannel);
-        valid = valid && Buffer.from(options.extendedPanID!).equals(backup.networkOptions.extendedPanId);
-        valid = valid && Buffer.from(options.networkKey!).equals(backup.networkOptions.networkKey);
-        return valid;
     }
 }

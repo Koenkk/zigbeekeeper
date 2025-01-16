@@ -65,7 +65,7 @@ export class ZStackAdapter extends Adapter {
     private transactionID: number;
     // @ts-expect-error initialized in `start`
     private version: {
-        product: number;
+        product: ZnpVersion;
         transportrev: number;
         majorrel: number;
         minorrel: number;
@@ -138,12 +138,20 @@ export class ZStackAdapter extends Adapter {
         this.adapterManager = new ZnpAdapterManager(this, this.znp, {
             backupPath: this.backupPath,
             version: this.version.product,
-            greenPowerGroup: ZSpec.GP_GROUP_ID,
             networkOptions: this.networkOptions,
             adapterOptions: this.adapterOptions,
         });
 
-        const startResult = this.adapterManager.start();
+        const startResult = await this.initNetwork();
+
+        if (startResult === 'resumed') {
+            await this.adapterManager.resume();
+        }
+
+        await this.adapterManager.registerEndpoints();
+
+        /* add green power group */
+        await this.adapterManager.addToGroup(ZSpec.GP_ENDPOINT, ZSpec.GP_GROUP_ID);
 
         if (this.adapterOptions.disableLED) {
             // Wait a bit for adapter to startup, otherwise led doesn't disable (tested with CC2531)
@@ -155,12 +163,39 @@ export class ZStackAdapter extends Adapter {
             await this.znp.request(Subsystem.SYS, 'stackTune', {operation: 0, value: this.adapterOptions.transmitPower});
         }
 
-        return await startResult;
+        return startResult;
     }
 
     public async stop(): Promise<void> {
         this.closing = true;
         await this.znp.close();
+    }
+
+    /**
+     * Check the network status on the adapter (execute the necessary pre-steps to be able to get it).
+     * WARNING: This is a one-off. Should not be called outside of `initNetwork`.
+     */
+    protected async initHasNetwork(): Promise<[true, panID: number, extendedPanID: Buffer] | [false, panID: undefined, extendedPanID: undefined]> {
+        return await this.adapterManager.initHasNetwork();
+    }
+
+    public async leaveNetwork(): Promise<void> {
+        return await this.adapterManager.leaveNetwork();
+    }
+
+    /**
+     * If backup is defined, form network from backup, otherwise from config.
+     */
+    public async formNetwork(backup?: Models.Backup): Promise<StartResult | void> {
+        if (backup) {
+            await this.adapterManager.restore(backup);
+        } else {
+            return await this.adapterManager.reset();
+        }
+    }
+
+    public async getNetworkKey(): Promise<Buffer> {
+        return await this.adapterManager.getNetworkKey();
     }
 
     public async getCoordinatorIEEE(): Promise<string> {
@@ -896,8 +931,25 @@ export class ZStackAdapter extends Adapter {
         return true;
     }
 
+    public checkBackup(backup: Models.Backup): void {
+        if (!backup.znp?.trustCenterLinkKeySeed) {
+            throw new Error(`Current backup file is not for zStack.`);
+        }
+
+        if (
+            this.version.product === ZnpVersion.zStack12 &&
+            backup &&
+            backup.znp?.version !== undefined &&
+            backup.znp.version !== ZnpVersion.zStack12
+        ) {
+            throw new Error(
+                `your backup is from newer platform version (Z-Stack 3.0.x+) and cannot be restored onto Z-Stack 1.2 adapter - please remove backup before proceeding`,
+            );
+        }
+    }
+
     public async backup(ieeeAddressesInDatabase: string[]): Promise<Models.Backup> {
-        return await this.adapterManager.backup.createBackup(ieeeAddressesInDatabase);
+        return await this.adapterManager.backup.createBackup(ieeeAddressesInDatabase, this.getStoredBackup.bind(this));
     }
 
     public async setChannelInterPAN(channel: number): Promise<void> {

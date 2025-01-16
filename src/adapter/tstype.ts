@@ -10,10 +10,10 @@ export type USBAdapterFingerprint = {
 
 export interface NetworkOptions {
     panID: number;
-    extendedPanID?: number[];
+    extendedPanID: number[];
     channelList: number[];
-    networkKey?: number[];
-    networkKeyDistribute?: boolean;
+    networkKey: number[];
+    networkKeyDistribute: boolean;
 }
 
 export interface SerialPortOptions {

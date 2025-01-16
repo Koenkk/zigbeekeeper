@@ -1,12 +1,12 @@
 import {randomBytes} from 'node:crypto';
-import {existsSync, readFileSync, renameSync} from 'node:fs';
+import {readFileSync} from 'node:fs';
 import path from 'node:path';
 
 import equals from 'fast-deep-equal/es6';
 
 import {Adapter, TsType} from '../..';
-import {Backup, UnifiedBackupStorage} from '../../../models';
-import {BackupUtils, Queue, wait} from '../../../utils';
+import {Backup} from '../../../models';
+import {Queue, wait} from '../../../utils';
 import {logger} from '../../../utils/logger';
 import * as ZSpec from '../../../zspec';
 import {EUI64, ExtendedPanId, NodeId, PanId} from '../../../zspec/tstypes';
@@ -94,19 +94,6 @@ export type LinkKeyBackupData = {
     incomingFrameCounter: number;
 };
 
-enum NetworkInitAction {
-    /** Ain't that nice! */
-    DONE,
-    /** Config mismatch, must leave network. */
-    LEAVE,
-    /** Config mismatched, left network. Will evaluate forming from backup or config next. */
-    LEFT,
-    /** Form the network using config. No backup, or backup mismatch. */
-    FORM_CONFIG,
-    /** Re-form the network using full backed-up data. */
-    FORM_BACKUP,
-}
-
 /**
  * Application generated ZDO messages use sequence numbers 0-127, and the stack
  * uses sequence numbers 128-255.  This simplifies life by eliminating the need
@@ -116,8 +103,6 @@ enum NetworkInitAction {
 const APPLICATION_ZDO_SEQUENCE_MASK = 0x7f;
 /* Default radius used for broadcast ZDO requests. uint8_t */
 const ZDO_REQUEST_RADIUS = 0xff;
-/** Oldest supported EZSP version for backups. Don't take the risk to restore a broken network until older backup versions can be investigated. */
-const BACKUP_OLDEST_SUPPORTED_EZSP_VERSION = 12;
 /**
  * 9sec is minimum recommended for `ezspBroadcastNextNetworkKey` to have propagated throughout network.
  * NOTE: This is blocking the request queue, so we shouldn't go crazy high.
@@ -709,7 +694,8 @@ export class EmberAdapter extends Adapter {
         await this.registerFixedEndpoints();
         this.clearNetworkCache();
 
-        result = await this.initTrustCenter();
+        await this.initTrustCenter();
+        result = await this.initNetwork();
 
         // after network UP, as per SDK, ensures clean slate
         await this.initNCPConcentrator();
@@ -822,217 +808,37 @@ export class EmberAdapter extends Adapter {
         }
     }
 
-    /**
-     *
-     * @returns True if the network needed to be formed.
-     */
-    private async initTrustCenter(): Promise<TsType.StartResult> {
+    private async initTrustCenter(): Promise<void> {
         // init TC policies
-        {
-            let status = await this.emberSetEzspPolicy(EzspPolicyId.TC_KEY_REQUEST_POLICY, EzspDecisionId.ALLOW_TC_KEY_REQUESTS_AND_SEND_CURRENT_KEY);
+        let status = await this.emberSetEzspPolicy(EzspPolicyId.TC_KEY_REQUEST_POLICY, EzspDecisionId.ALLOW_TC_KEY_REQUESTS_AND_SEND_CURRENT_KEY);
 
-            if (status !== SLStatus.OK) {
-                throw new Error(
-                    `[INIT TC] Failed to set EzspPolicyId TC_KEY_REQUEST_POLICY to ALLOW_TC_KEY_REQUESTS_AND_SEND_CURRENT_KEY with status=${SLStatus[status]}.`,
-                );
-            }
-
-            /* v8 ignore next */
-            const appKeyRequestsPolicy = ALLOW_APP_KEY_REQUESTS ? EzspDecisionId.ALLOW_APP_KEY_REQUESTS : EzspDecisionId.DENY_APP_KEY_REQUESTS;
-            status = await this.emberSetEzspPolicy(EzspPolicyId.APP_KEY_REQUEST_POLICY, appKeyRequestsPolicy);
-
-            if (status !== SLStatus.OK) {
-                throw new Error(
-                    `[INIT TC] Failed to set EzspPolicyId APP_KEY_REQUEST_POLICY to ${EzspDecisionId[appKeyRequestsPolicy]} with status=${SLStatus[status]}.`,
-                );
-            }
-
-            status = await this.emberSetJoinPolicy(EmberJoinDecision.USE_PRECONFIGURED_KEY);
-
-            if (status !== SLStatus.OK) {
-                throw new Error(`[INIT TC] Failed to set join policy to USE_PRECONFIGURED_KEY with status=${SLStatus[status]}.`);
-            }
-        }
-
-        const configNetworkKey = Buffer.from(this.networkOptions.networkKey!);
-        const networkInitStruct: EmberNetworkInitStruct = {
-            bitmask: EmberNetworkInitBitmask.PARENT_INFO_IN_TOKEN | EmberNetworkInitBitmask.END_DEVICE_REJOIN_ON_REBOOT,
-        };
-        const initStatus = await this.ezsp.ezspNetworkInit(networkInitStruct);
-
-        logger.debug(`[INIT TC] Network init status=${SLStatus[initStatus]}.`, NS);
-
-        if (initStatus !== SLStatus.OK && initStatus !== SLStatus.NOT_JOINED) {
-            throw new Error(`[INIT TC] Failed network init request with status=${SLStatus[initStatus]}.`);
-        }
-
-        let action: NetworkInitAction = NetworkInitAction.DONE;
-
-        if (initStatus === SLStatus.OK) {
-            // network
-            await this.oneWaitress.startWaitingForEvent(
-                {eventName: OneWaitressEvents.STACK_STATUS_NETWORK_UP},
-                DEFAULT_NETWORK_REQUEST_TIMEOUT,
-                '[INIT TC] Network init',
+        if (status !== SLStatus.OK) {
+            throw new Error(
+                `[INIT TC] Failed to set EzspPolicyId TC_KEY_REQUEST_POLICY to ALLOW_TC_KEY_REQUESTS_AND_SEND_CURRENT_KEY with status=${SLStatus[status]}.`,
             );
-
-            const [npStatus, nodeType, netParams] = await this.ezsp.ezspGetNetworkParameters();
-
-            logger.debug(() => `[INIT TC] Current adapter network: nodeType=${EmberNodeType[nodeType]} params=${JSON.stringify(netParams)}`, NS);
-
-            if (
-                npStatus === SLStatus.OK &&
-                nodeType === EmberNodeType.COORDINATOR &&
-                this.networkOptions.panID === netParams.panId &&
-                equals(this.networkOptions.extendedPanID, netParams.extendedPanId)
-            ) {
-                // config matches adapter so far, no error, we can check the network key
-                const context = initSecurityManagerContext();
-                context.coreKeyType = SecManKeyType.NETWORK;
-                context.keyIndex = 0;
-                const [nkStatus, networkKey] = await this.ezsp.ezspExportKey(context);
-
-                if (nkStatus !== SLStatus.OK) {
-                    throw new Error(`[INIT TC] Failed to export Network Key with status=${SLStatus[nkStatus]}.`);
-                }
-
-                // config doesn't match adapter anymore
-                if (!networkKey.contents.equals(configNetworkKey)) {
-                    action = NetworkInitAction.LEAVE;
-                }
-            } else {
-                // config doesn't match adapter
-                action = NetworkInitAction.LEAVE;
-            }
-
-            if (action === NetworkInitAction.LEAVE) {
-                logger.info(`[INIT TC] Adapter network does not match config. Leaving network...`, NS);
-                const leaveStatus = await this.ezsp.ezspLeaveNetwork();
-
-                if (leaveStatus !== SLStatus.OK) {
-                    throw new Error(`[INIT TC] Failed leave network request with status=${SLStatus[leaveStatus]}.`);
-                }
-
-                await this.oneWaitress.startWaitingForEvent(
-                    {eventName: OneWaitressEvents.STACK_STATUS_NETWORK_DOWN},
-                    DEFAULT_NETWORK_REQUEST_TIMEOUT,
-                    '[INIT TC] Leave network',
-                );
-
-                await wait(200); // settle down
-
-                action = NetworkInitAction.LEFT;
-            }
         }
 
-        const backup = this.getStoredBackup();
+        /* v8 ignore next */
+        const appKeyRequestsPolicy = ALLOW_APP_KEY_REQUESTS ? EzspDecisionId.ALLOW_APP_KEY_REQUESTS : EzspDecisionId.DENY_APP_KEY_REQUESTS;
+        status = await this.emberSetEzspPolicy(EzspPolicyId.APP_KEY_REQUEST_POLICY, appKeyRequestsPolicy);
 
-        if (initStatus === SLStatus.NOT_JOINED || action === NetworkInitAction.LEFT) {
-            // no network
-            if (backup != undefined) {
-                if (
-                    this.networkOptions.panID === backup.networkOptions.panId &&
-                    Buffer.from(this.networkOptions.extendedPanID!).equals(backup.networkOptions.extendedPanId) &&
-                    this.networkOptions.channelList.includes(backup.logicalChannel) &&
-                    configNetworkKey.equals(backup.networkOptions.networkKey)
-                ) {
-                    // config matches backup
-                    action = NetworkInitAction.FORM_BACKUP;
-                } else {
-                    // config doesn't match backup
-                    logger.info(`[INIT TC] Config does not match backup.`, NS);
-                    action = NetworkInitAction.FORM_CONFIG;
-                }
-            } else {
-                // no backup
-                logger.info(`[INIT TC] No valid backup found.`, NS);
-                action = NetworkInitAction.FORM_CONFIG;
-            }
+        if (status !== SLStatus.OK) {
+            throw new Error(
+                `[INIT TC] Failed to set EzspPolicyId APP_KEY_REQUEST_POLICY to ${EzspDecisionId[appKeyRequestsPolicy]} with status=${SLStatus[status]}.`,
+            );
         }
 
-        //---- from here on, we assume everything is in place for whatever decision was taken above
+        status = await this.emberSetJoinPolicy(EmberJoinDecision.USE_PRECONFIGURED_KEY);
 
-        let result: TsType.StartResult = 'resumed';
-
-        switch (action) {
-            case NetworkInitAction.FORM_BACKUP: {
-                logger.info(`[INIT TC] Forming from backup.`, NS);
-                // `backup` valid in this `action` path (not detected by TS)
-                /* v8 ignore start */
-                const keyList: LinkKeyBackupData[] = backup!.devices.map((device) => ({
-                    deviceEui64: ZSpec.Utils.eui64BEBufferToHex(device.ieeeAddress),
-                    key: {contents: device.linkKey!.key},
-                    outgoingFrameCounter: device.linkKey!.txCounter,
-                    incomingFrameCounter: device.linkKey!.rxCounter,
-                }));
-                /* v8 ignore stop */
-
-                // before forming
-                await this.importLinkKeys(keyList);
-
-                await this.formNetwork(
-                    true /*from backup*/,
-                    backup!.networkOptions.networkKey,
-                    backup!.networkKeyInfo.sequenceNumber,
-                    backup!.networkKeyInfo.frameCounter,
-                    backup!.networkOptions.panId,
-                    Array.from(backup!.networkOptions.extendedPanId),
-                    backup!.logicalChannel,
-                    backup!.ezsp!.hashed_tclk!, // valid from getStoredBackup
-                );
-
-                result = 'restored';
-                break;
-            }
-            case NetworkInitAction.FORM_CONFIG: {
-                logger.info(`[INIT TC] Forming from config.`, NS);
-                await this.formNetwork(
-                    false /*from config*/,
-                    configNetworkKey,
-                    0,
-                    0,
-                    this.networkOptions.panID,
-                    this.networkOptions.extendedPanID!,
-                    this.networkOptions.channelList[0],
-                    randomBytes(EMBER_ENCRYPTION_KEY_SIZE), // rnd TC link key
-                );
-
-                result = 'reset';
-                break;
-            }
-            case NetworkInitAction.DONE: {
-                logger.info(`[INIT TC] Adapter network matches config.`, NS);
-                break;
-            }
+        if (status !== SLStatus.OK) {
+            throw new Error(`[INIT TC] Failed to set join policy to USE_PRECONFIGURED_KEY with status=${SLStatus[status]}.`);
         }
-
-        // can't let frame counter wrap to zero (uint32_t), will force a broadcast after init if getting too close
-        if (backup != null && backup.networkKeyInfo.frameCounter > 0xfeeeeeee) {
-            // XXX: while this remains a pretty low occurrence in most (small) networks,
-            //      currently Z2M won't support the key update because of one-way config...
-            //      need to investigate handling this properly
-
-            // logger.warning(`[INIT TC] Network key frame counter is reaching its limit. Scheduling broadcast to update network key. `
-            //     + `This may result in some devices (especially battery-powered) temporarily losing connection.`, NS);
-            // // XXX: no idea here on the proper timer value, but this will block the network for several seconds on exec
-            // //      (probably have to take the behavior of sleepy-end devices into account to improve chances of reaching everyone right away?)
-            // setTimeout(async () => {
-            //     this.requestQueue.enqueue(async (): Promise<SLStatus> => {
-            //         await this.broadcastNetworkKeyUpdate();
-
-            //         return SLStatus.OK;
-            //     }, logger.error, true);// no reject just log error if any, will retry next start, & prioritize so we know it'll run when expected
-            // }, 300000);
-            logger.warning(`[INIT TC] Network key frame counter is reaching its limit. A new network key will have to be instaured soon.`, NS);
-        }
-
-        return result;
     }
 
     /**
      * Form a network using given parameters.
      */
-    private async formNetwork(
+    private async formNetworkInternal(
         fromBackup: boolean,
         networkKey: Buffer,
         networkKeySequenceNumber: number,
@@ -1122,43 +928,6 @@ export class EmberAdapter extends Adapter {
 
         logger.debug(`[INIT FORM] Start writing stack tokens status=${SLStatus[status]}.`, NS);
         logger.info(`[INIT FORM] New network formed!`, NS);
-    }
-
-    /**
-     * Loads currently stored backup and returns it in internal backup model.
-     */
-    private getStoredBackup(): Backup | undefined {
-        if (!existsSync(this.backupPath)) {
-            return undefined;
-        }
-
-        let data: UnifiedBackupStorage;
-
-        try {
-            data = JSON.parse(readFileSync(this.backupPath).toString());
-        } catch (error) {
-            throw new Error(`[BACKUP] Coordinator backup is corrupted. (${(error as Error).stack})`);
-        }
-
-        if (data.metadata?.format === 'zigpy/open-coordinator-backup' && data.metadata?.version) {
-            if (data.metadata?.version !== 1) {
-                throw new Error(`[BACKUP] Unsupported open coordinator backup version (version=${data.metadata?.version}).`);
-            }
-
-            if (!data.stack_specific?.ezsp || !data.metadata.internal.ezspVersion) {
-                throw new Error(`[BACKUP] Current backup file is not for EmberZNet stack.`);
-            }
-
-            if (data.metadata.internal.ezspVersion < BACKUP_OLDEST_SUPPORTED_EZSP_VERSION) {
-                renameSync(this.backupPath, `${this.backupPath}.old`);
-                logger.warning(`[BACKUP] Current backup file is from an unsupported EZSP version. Renaming and ignoring.`, NS);
-                return undefined;
-            }
-
-            return BackupUtils.fromUnifiedBackup(data);
-        } else {
-            throw new Error(`[BACKUP] Unknown backup format.`);
-        }
     }
 
     /**
@@ -1543,6 +1312,119 @@ export class EmberAdapter extends Adapter {
         logger.info(`======== Ember Adapter Stopped ========`, NS);
     }
 
+    /**
+     * Check the network status on the adapter (execute the necessary pre-steps to be able to get it).
+     * WARNING: This is a one-off. Should not be called outside of `initNetwork`.
+     */
+    protected async initHasNetwork(): Promise<[true, panID: number, extendedPanID: Buffer] | [false, panID: undefined, extendedPanID: undefined]> {
+        const networkInitStruct: EmberNetworkInitStruct = {
+            bitmask: EmberNetworkInitBitmask.PARENT_INFO_IN_TOKEN | EmberNetworkInitBitmask.END_DEVICE_REJOIN_ON_REBOOT,
+        };
+        const initStatus = await this.ezsp.ezspNetworkInit(networkInitStruct);
+
+        logger.debug(`Network init status=${SLStatus[initStatus]}.`, NS);
+
+        if (initStatus !== SLStatus.OK && initStatus !== SLStatus.NOT_JOINED) {
+            throw new Error(`Failed network init request with status=${SLStatus[initStatus]}.`);
+        }
+
+        if (initStatus === SLStatus.OK) {
+            await this.oneWaitress.startWaitingForEvent(
+                {eventName: OneWaitressEvents.STACK_STATUS_NETWORK_UP},
+                DEFAULT_NETWORK_REQUEST_TIMEOUT,
+                'Network init',
+            );
+
+            const [npStatus, nodeType, netParams] = await this.ezsp.ezspGetNetworkParameters();
+
+            if (npStatus !== SLStatus.OK) {
+                throw new Error(`Failed to get network parameters with status=${SLStatus[npStatus]}.`);
+            }
+
+            logger.debug(() => `Current adapter network: nodeType=${EmberNodeType[nodeType]} params=${JSON.stringify(netParams)}`, NS);
+
+            // force forming in case current network is `ROUTER` type
+            if (nodeType !== EmberNodeType.COORDINATOR) {
+                return [false, undefined, undefined];
+            }
+
+            return [true, netParams.panId, Buffer.from(netParams.extendedPanId)];
+        }
+
+        return [false, undefined, undefined];
+    }
+
+    public async leaveNetwork(): Promise<void> {
+        const leaveStatus = await this.ezsp.ezspLeaveNetwork();
+
+        if (leaveStatus !== SLStatus.OK) {
+            throw new Error(`Failed leave network request with status=${SLStatus[leaveStatus]}.`);
+        }
+
+        await this.oneWaitress.startWaitingForEvent(
+            {eventName: OneWaitressEvents.STACK_STATUS_NETWORK_DOWN},
+            DEFAULT_NETWORK_REQUEST_TIMEOUT,
+            'Leave network',
+        );
+
+        await wait(200); // settle down
+    }
+
+    public async formNetwork(backup?: Backup): Promise<void> {
+        if (backup) {
+            logger.info(`[INIT FORM] Forming from backup.`, NS);
+            // `backup` valid in this `action` path (not detected by TS)
+            /* v8 ignore start */
+            const keyList: LinkKeyBackupData[] = backup!.devices.map((device) => ({
+                deviceEui64: ZSpec.Utils.eui64BEBufferToHex(device.ieeeAddress),
+                key: {contents: device.linkKey!.key},
+                outgoingFrameCounter: device.linkKey!.txCounter,
+                incomingFrameCounter: device.linkKey!.rxCounter,
+            }));
+            /* v8 ignore stop */
+
+            // before forming
+            await this.importLinkKeys(keyList);
+
+            await this.formNetworkInternal(
+                true /*from backup*/,
+                backup.networkOptions.networkKey,
+                backup.networkKeyInfo.sequenceNumber,
+                backup.networkKeyInfo.frameCounter,
+                backup.networkOptions.panId,
+                Array.from(backup.networkOptions.extendedPanId),
+                backup.logicalChannel,
+                backup.ezsp!.hashed_tclk!, // valid from checkBackup
+            );
+        } else {
+            logger.info(`[INIT FORM] Forming from config.`, NS);
+            await this.formNetworkInternal(
+                false /*from config*/,
+                Buffer.from(this.networkOptions.networkKey),
+                0,
+                0,
+                this.networkOptions.panID,
+                this.networkOptions.extendedPanID,
+                this.networkOptions.channelList[0],
+                randomBytes(EMBER_ENCRYPTION_KEY_SIZE), // rnd TC link key
+            );
+        }
+    }
+
+    public async getNetworkKey(): Promise<Buffer> {
+        // config matches adapter so far, no error, we can check the network key
+        const context = initSecurityManagerContext();
+        context.coreKeyType = SecManKeyType.NETWORK;
+        context.keyIndex = 0;
+        const [nkStatus, networkKey] = await this.ezsp.ezspExportKey(context);
+
+        if (nkStatus !== SLStatus.OK) {
+            throw new Error(`Failed to export Network Key with status=${SLStatus[nkStatus]}.`);
+        }
+
+        return networkKey.contents;
+    }
+
     public async getCoordinatorIEEE(): Promise<string> {
         return await this.queue.execute(async () => {
             this.checkInterpanLock();
@@ -1566,6 +1448,12 @@ export class EmberAdapter extends Adapter {
 
     public async supportsBackup(): Promise<boolean> {
         return true;
+    }
+
+    public checkBackup(backup: Backup): void {
+        if (!backup.ezsp?.hashed_tclk) {
+            throw new Error(`[BACKUP] Current backup file is not for EmberZNet stack.`);
+        }
     }
 
     // queued

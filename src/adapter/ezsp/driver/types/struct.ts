@@ -33,22 +33,14 @@ export class EzspStruct {
 }
 
 export class EmberNetworkParameters extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public extendedPanId: Buffer;
-    // @ts-expect-error set via _fields
-    public panId: number;
-    // @ts-expect-error set via _fields
-    public radioTxPower: number;
-    // @ts-expect-error set via _fields
-    public radioChannel: number;
-    // @ts-expect-error set via _fields
-    public joinMethod: named.EmberJoinMethod;
-    // @ts-expect-error set via _fields
-    public nwkManagerId: named.EmberNodeId;
-    // @ts-expect-error set via _fields
-    public nwkUpdateId: number;
-    // @ts-expect-error set via _fields
-    public channels: number;
+    public extendedPanId!: Buffer;
+    public panId!: number;
+    public radioTxPower!: number;
+    public radioChannel!: number;
+    public joinMethod!: named.EmberJoinMethod;
+    public nwkManagerId!: named.EmberNodeId;
+    public nwkUpdateId!: number;
+    public channels!: number;
 
     static _fields = [
         // The network's extended PAN identifier.
@@ -97,16 +89,11 @@ export class EmberZigbeeNetwork extends EzspStruct {
 }
 
 export class EmberApsFrame extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public profileId: number;
-    // @ts-expect-error set via _fields
-    public sequence: number;
-    // @ts-expect-error set via _fields
-    public clusterId: number;
-    // @ts-expect-error set via _fields
-    public sourceEndpoint: number;
-    // @ts-expect-error set via _fields
-    public destinationEndpoint: number;
+    public profileId!: number;
+    public sequence!: number;
+    public clusterId!: number;
+    public sourceEndpoint!: number;
+    public destinationEndpoint!: number;
     public groupId?: number;
     public options?: named.EmberApsOption;
 
@@ -154,12 +141,9 @@ export class EmberBindingTableEntry extends EzspStruct {
 }
 
 export class EmberMulticastTableEntry extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public multicastId: number;
-    // @ts-expect-error set via _fields
-    public endpoint: number;
-    // @ts-expect-error set via _fields
-    public networkIndex: number;
+    public multicastId!: number;
+    public endpoint!: number;
+    public networkIndex!: number;
     // A multicast table entry indicates that a particular endpoint is a member
     // of a particular multicast group.Only devices with an endpoint in a
     // multicast group will receive messages sent to that multicast group.
@@ -175,8 +159,7 @@ export class EmberMulticastTableEntry extends EzspStruct {
 }
 
 export class EmberKeyData extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public contents: Buffer;
+    public contents!: Buffer;
     // A 128- bit key.
     static _fields = [
         // The key data.
@@ -185,8 +168,7 @@ export class EmberKeyData extends EzspStruct {
 }
 
 export class EmberCertificateData extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public contents: Buffer;
+    public contents!: Buffer;
     // The implicit certificate used in CBKE.
     static _fields = [
         // The certificate data.
@@ -195,8 +177,7 @@ export class EmberCertificateData extends EzspStruct {
 }
 
 export class EmberPublicKeyData extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public contents: Buffer;
+    public contents!: Buffer;
     // The public key data used in CBKE.
     static _fields = [
         // The public key data.
@@ -205,8 +186,7 @@ export class EmberPublicKeyData extends EzspStruct {
 }
 
 export class EmberPrivateKeyData extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public contents: Buffer;
+    public contents!: Buffer;
     // The private key data used in CBKE.
     static _fields = [
         // The private key data.
@@ -271,10 +251,8 @@ export class EmberMessageDigest extends EzspStruct {
 }
 
 export class EmberAesMmoHashContext extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public result: Buffer;
-    // @ts-expect-error set via _fields
-    public length: number;
+    public result!: Buffer;
+    public length!: number;
     // The hash context for an ongoing hash operation.
     static _fields = [
         // The result of ongoing the hash operation.
@@ -336,16 +314,11 @@ export class EmberRouteTableEntry extends EzspStruct {
 }
 
 export class EmberInitialSecurityState extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public bitmask: number;
-    // @ts-expect-error set via _fields
-    public preconfiguredKey: EmberKeyData;
-    // @ts-expect-error set via _fields
-    public networkKey: EmberKeyData;
-    // @ts-expect-error set via _fields
-    public networkKeySequenceNumber: number;
-    // @ts-expect-error set via _fields
-    public preconfiguredTrustCenterEui64: named.EmberEUI64;
+    public bitmask!: number;
+    public preconfiguredKey!: EmberKeyData;
+    public networkKey!: EmberKeyData;
+    public networkKeySequenceNumber!: number;
+    public preconfiguredTrustCenterEui64!: named.EmberEUI64;
 
     // The security data used to set the configuration for the stack, or the
     // retrieved configuration currently in use.
@@ -390,12 +363,9 @@ export class EmberCurrentSecurityState extends EzspStruct {
 }
 
 export class EmberKeyStruct extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public key: EmberKeyData;
-    // @ts-expect-error set via _fields
-    public outgoingFrameCounter: number;
-    // @ts-expect-error set via _fields
-    public sequenceNumber: number;
+    public key!: EmberKeyData;
+    public outgoingFrameCounter!: number;
+    public sequenceNumber!: number;
     // A structure containing a key and its associated data.
     static _fields = [
         // A bitmask indicating the presence of data within the various fields
@@ -723,26 +693,16 @@ export class EmberRoutingTable extends EzspStruct {
 }
 
 export class EmberRawFrame extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public ieeeFrameControl: number;
-    // @ts-expect-error set via _fields
-    public sequence: number;
-    // @ts-expect-error set via _fields
-    public destPanId: number;
-    // @ts-expect-error set via _fields
-    public destNodeId: named.EmberNodeId;
-    // @ts-expect-error set via _fields
-    public sourcePanId: number;
-    // @ts-expect-error set via _fields
-    public ieeeAddress: named.EmberEUI64;
-    // @ts-expect-error set via _fields
-    public nwkFrameControl: number;
-    // @ts-expect-error set via _fields
-    public appFrameControl: number;
-    // @ts-expect-error set via _fields
-    public clusterId: number;
-    // @ts-expect-error set via _fields
-    public profileId: number;
+    public ieeeFrameControl!: number;
+    public sequence!: number;
+    public destPanId!: number;
+    public destNodeId!: named.EmberNodeId;
+    public sourcePanId!: number;
+    public ieeeAddress!: named.EmberEUI64;
+    public nwkFrameControl!: number;
+    public appFrameControl!: number;
+    public clusterId!: number;
+    public profileId!: number;
 
     static _fields = [
         ['ieeeFrameControl', basic.uint16_t],
@@ -759,26 +719,16 @@ export class EmberRawFrame extends EzspStruct {
 }
 
 export class EmberIeeeRawFrame extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public ieeeFrameControl: number;
-    // @ts-expect-error set via _fields
-    public sequence: number;
-    // @ts-expect-error set via _fields
-    public destPanId: number;
-    // @ts-expect-error set via _fields
-    public destAddress: named.EmberEUI64;
-    // @ts-expect-error set via _fields
-    public sourcePanId: number;
-    // @ts-expect-error set via _fields
-    public sourceAddress: named.EmberEUI64;
-    // @ts-expect-error set via _fields
-    public nwkFrameControl: number;
-    // @ts-expect-error set via _fields
-    public appFrameControl: number;
-    // @ts-expect-error set via _fields
-    public clusterId: number;
-    // @ts-expect-error set via _fields
-    public profileId: number;
+    public ieeeFrameControl!: number;
+    public sequence!: number;
+    public destPanId!: number;
+    public destAddress!: named.EmberEUI64;
+    public sourcePanId!: number;
+    public sourceAddress!: named.EmberEUI64;
+    public nwkFrameControl!: number;
+    public appFrameControl!: number;
+    public clusterId!: number;
+    public profileId!: number;
     static _fields = [
         ['ieeeFrameControl', basic.uint16_t],
         ['sequence', basic.uint8_t],
@@ -795,20 +745,13 @@ export class EmberIeeeRawFrame extends EzspStruct {
 
 export class EmberSecurityManagerContext extends EzspStruct {
     // Context for Zigbee Security Manager operations.
-    // @ts-expect-error set via _fields
-    public type: named.EmberKeyType;
-    // @ts-expect-error set via _fields
-    public index: number;
-    // @ts-expect-error set via _fields
-    public derivedType: named.EmberDerivedKeyType;
-    // @ts-expect-error set via _fields
-    public eui64: named.EmberEUI64;
-    // @ts-expect-error set via _fields
-    public multiNetworkIndex: number;
-    // @ts-expect-error set via _fields
-    public flags: number;
-    // @ts-expect-error set via _fields
-    public psaKeyAlgPermission: basic.uint32_t;
+    public type!: named.EmberKeyType;
+    public index!: number;
+    public derivedType!: named.EmberDerivedKeyType;
+    public eui64!: named.EmberEUI64;
+    public multiNetworkIndex!: number;
+    public flags!: number;
+    public psaKeyAlgPermission!: basic.uint32_t;
     static _fields = [
         // The type of key being referenced.
         ['type', named.EmberKeyType],
@@ -829,16 +772,11 @@ export class EmberSecurityManagerContext extends EzspStruct {
 
 /** This data structure contains the metadata pertaining to an network key */
 export class EmberSecurityManagerNetworkKeyInfo extends EzspStruct {
-    // @ts-expect-error set via _fields
-    public networkKeySet: number; // boolean
-    // @ts-expect-error set via _fields
-    public alternateNetworkKeySet: number; // boolean
-    // @ts-expect-error set via _fields
-    public networkKeySequenceNumber: number;
-    // @ts-expect-error set via _fields
-    public altNetworkKeySequenceNumber: number;
-    // @ts-expect-error set via _fields
-    public networkKeyFrameCounter: number;
+    public networkKeySet!: number; // boolean
+    public alternateNetworkKeySet!: number; // boolean
+    public networkKeySequenceNumber!: number;
+    public altNetworkKeySequenceNumber!: number;
+    public networkKeyFrameCounter!: number;
     static _fields = [
         ['networkKeySet', basic.uint8_t],
         ['alternateNetworkKeySet', basic.uint8_t],

@@ -13,7 +13,20 @@ import Adapter from '../../adapter';
 import {ZclPayload} from '../../events';
 import {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, SerialPortOptions, StartResult} from '../../tstype';
 import {Driver, EmberIncomingMessage} from '../driver';
-import {EmberEUI64, EmberStatus} from '../driver/types';
+import {
+    EmberEUI64,
+    EmberInitialSecurityBitmask,
+    EmberInitialSecurityState,
+    EmberJoinMethod,
+    EmberKeyData,
+    EmberKeyStruct,
+    EmberKeyType,
+    EmberNetworkParameters,
+    EmberNodeType,
+    EmberStatus,
+    EzspValueId,
+} from '../driver/types';
+import {ember_security} from '../driver/utils';
 
 const NS = 'zh:ezsp';
 
@@ -45,7 +58,7 @@ export class EZSPAdapter extends Adapter {
         logger.debug(`Adapter concurrent: ${concurrent}`, NS);
         this.queue = new Queue(concurrent);
 
-        this.driver = new Driver(this.serialPortOptions, this.networkOptions, backupPath);
+        this.driver = new Driver(this.serialPortOptions, backupPath, this.initNetwork.bind(this));
         this.driver.on('close', this.onDriverClose.bind(this));
         this.driver.on('deviceJoined', this.handleDeviceJoin.bind(this));
         this.driver.on('deviceLeft', this.handleDeviceLeft.bind(this));
@@ -142,12 +155,103 @@ export class EZSPAdapter extends Adapter {
             `'ezsp' driver is deprecated and will only remain to provide support for older firmware (pre 7.4.x). Migration to 'ember' is recommended. If using Zigbee2MQTT see https://github.com/Koenkk/zigbee2mqtt/discussions/21462`,
             NS,
         );
-        return await this.driver.startup(this.adapterOptions.transmitPower);
+
+        const result = await this.driver.startup();
+
+        if (this.adapterOptions.transmitPower != undefined && this.driver.networkParams.radioTxPower !== this.adapterOptions.transmitPower) {
+            await this.driver.ezsp.execCommand('setRadioPower', {power: this.adapterOptions.transmitPower});
+        }
+
+        return result;
     }
 
     public async stop(): Promise<void> {
         this.closing = true;
         await this.driver.stop();
+    }
+
+    /**
+     * Check the network status on the adapter (execute the necessary pre-steps to be able to get it).
+     * WARNING: This is a one-off. Should not be called outside of `initNetwork`.
+     */
+    protected async initHasNetwork(): Promise<[true, panID: number, extendedPanID: Buffer] | [false, panID: undefined, extendedPanID: undefined]> {
+        const hasNetwork = await this.driver.ezsp.networkInit();
+
+        if (hasNetwork) {
+            const {status, nodeType, parameters} = await this.driver.ezsp.execCommand('getNetworkParameters');
+
+            if (status !== EmberStatus.SUCCESS) {
+                throw new Error(`Failed to get network parameters`);
+            }
+
+            // force forming in case current network is `ROUTER` type
+            if (nodeType !== EmberNodeType.COORDINATOR) {
+                return [false, undefined, undefined];
+            }
+
+            logger.debug(
+                () => `Current adapter network: nodeType=${EmberNodeType.valueToName(EmberNodeType, nodeType)} params=${JSON.stringify(parameters)}`,
+                NS,
+            );
+
+            return [true, (parameters as EmberNetworkParameters).panId, (parameters as EmberNetworkParameters).extendedPanId];
+        }
+
+        return [false, undefined, undefined];
+    }
+
+    public async leaveNetwork(): Promise<void> {
+        await this.driver.ezsp.leaveNetwork();
+    }
+
+    public async formNetwork(backup?: Models.Backup): Promise<void> {
+        await this.driver.ezsp.execCommand('clearTransientLinkKeys');
+
+        if (backup) {
+            const initial_security_state: EmberInitialSecurityState = ember_security(backup.networkOptions.networkKey);
+            initial_security_state.bitmask |= EmberInitialSecurityBitmask.NO_FRAME_COUNTER_RESET;
+            initial_security_state.networkKeySequenceNumber = backup.networkKeyInfo.sequenceNumber;
+            // valid from `checkBackup`
+            initial_security_state.preconfiguredKey.contents = backup.ezsp!.hashed_tclk!;
+
+            await this.driver.ezsp.setInitialSecurityState(initial_security_state);
+        } else {
+            await this.driver.ezsp.execCommand('clearKeyTable');
+            const initial_security_state: EmberInitialSecurityState = ember_security(Buffer.from(this.networkOptions.networkKey));
+
+            await this.driver.ezsp.setInitialSecurityState(initial_security_state);
+        }
+
+        const parameters: EmberNetworkParameters = new EmberNetworkParameters();
+        parameters.radioTxPower = this.adapterOptions.transmitPower ?? 5;
+        parameters.joinMethod = EmberJoinMethod.USE_MAC_ASSOCIATION;
+        parameters.nwkManagerId = 0;
+        parameters.nwkUpdateId = 0;
+        parameters.channels = 0x07fff800; // all channels
+
+        if (backup) {
+            parameters.panId = backup.networkOptions.panId;
+            parameters.extendedPanId = backup.networkOptions.extendedPanId;
+            parameters.radioChannel = backup.logicalChannel;
+            parameters.nwkUpdateId = backup.networkUpdateId;
+        } else {
+            parameters.radioChannel = this.networkOptions.channelList[0];
+            parameters.panId = this.networkOptions.panID;
+            parameters.extendedPanId = Buffer.from(this.networkOptions.extendedPanID);
+        }
+
+        await this.driver.ezsp.formNetwork(parameters);
+        await this.driver.ezsp.setValue(EzspValueId.VALUE_STACK_TOKEN_WRITING, 1);
+    }
+
+    public async getNetworkKey(): Promise<Buffer> {
+        const networkKey = await this.driver.getKey(EmberKeyType.CURRENT_NETWORK_KEY);
+
+        if (this.driver.ezsp.ezspV < 13) {
+            return Buffer.from((networkKey.keyStruct as EmberKeyStruct).key.contents);
+        } else {
+            return Buffer.from((networkKey.keyData as EmberKeyData).contents);
+        }
     }
 
     public async onDriverClose(): Promise<void> {
@@ -467,6 +571,12 @@ export class EZSPAdapter extends Adapter {
 
     public async supportsBackup(): Promise<boolean> {
         return true;
+    }
+
+    public checkBackup(backup: Models.Backup): void {
+        if (!backup.ezsp?.hashed_tclk) {
+            throw new Error(`Current backup file is not for EmberZNet stack.`);
+        }
     }
 
     public async backup(): Promise<Models.Backup> {

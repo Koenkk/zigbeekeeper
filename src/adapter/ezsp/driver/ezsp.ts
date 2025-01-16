@@ -477,8 +477,7 @@ export class Ezsp extends EventEmitter {
 
         if (result.status !== EmberStatus.SUCCESS) {
             this.waitress.remove(waiter.ID);
-            logger.error('Failure to init network', NS);
-            return false;
+            throw new Error('Failure to init network');
         }
 
         const response = await waiter.start().promise;
@@ -494,16 +493,13 @@ export class Ezsp extends EventEmitter {
 
         if (result.status !== EmberStatus.SUCCESS) {
             this.waitress.remove(waiter.ID);
-            logger.debug('Failure to leave network', NS);
             throw new Error('Failure to leave network: ' + JSON.stringify(result));
         }
 
         const response = await waiter.start().promise;
 
         if (response.payload.status !== EmberStatus.NETWORK_DOWN) {
-            const msg = `Wrong network status: ${JSON.stringify(response.payload)}`;
-            logger.debug(msg, NS);
-            throw new Error(msg);
+            throw new Error(`Wrong network status: ${JSON.stringify(response.payload)}`);
         }
 
         return response.payload.status;

@@ -66,45 +66,88 @@ export class ZiGateAdapter extends Adapter {
      * Adapter methods
      */
     public async start(): Promise<TsType.StartResult> {
-        let startResult: TsType.StartResult = 'resumed';
-        try {
-            await this.driver.open();
-            logger.info('Connected to ZiGate adapter successfully.', NS);
+        await this.driver.open();
+        logger.info('Connected to ZiGate adapter successfully.', NS);
 
-            const resetResponse = await this.driver.sendCommand(ZiGateCommandCode.Reset, {}, 5000);
-            if (resetResponse.code === ZiGateMessageCode.RestartNonFactoryNew) {
-                startResult = 'resumed';
-            } else if (resetResponse.code === ZiGateMessageCode.RestartFactoryNew) {
-                startResult = 'reset';
-            }
-            await this.driver.sendCommand(ZiGateCommandCode.RawMode, {enabled: 0x01});
-            // @todo check
-            await this.driver.sendCommand(ZiGateCommandCode.SetDeviceType, {
-                deviceType: DEVICE_TYPE.coordinator,
-            });
-            await this.initNetwork();
+        // TODO: should always be called or only in `formNetwork`? this is not in doc API
+        await this.driver.sendCommand(ZiGateCommandCode.RawMode, {enabled: 0x01});
 
-            await this.driver.sendCommand(ZiGateCommandCode.AddGroup, {
-                addressMode: ADDRESS_MODE.short,
-                shortAddress: ZSpec.COORDINATOR_ADDRESS,
-                sourceEndpoint: ZSpec.HA_ENDPOINT,
-                destinationEndpoint: ZSpec.HA_ENDPOINT,
-                groupAddress: default_bind_group,
-            });
+        const result = await this.initNetwork();
 
-            if (this.adapterOptions.transmitPower != undefined) {
-                await this.driver.sendCommand(ZiGateCommandCode.SetTXpower, {value: this.adapterOptions.transmitPower});
-            }
-        } catch (error) {
-            throw new Error('failed to connect to zigate adapter ' + (error as Error).message);
+        await this.driver.sendCommand(ZiGateCommandCode.AddGroup, {
+            addressMode: ADDRESS_MODE.short,
+            shortAddress: ZSpec.COORDINATOR_ADDRESS,
+            sourceEndpoint: ZSpec.HA_ENDPOINT,
+            destinationEndpoint: ZSpec.HA_ENDPOINT,
+            groupAddress: default_bind_group,
+        });
+
+        if (this.adapterOptions.transmitPower != undefined) {
+            await this.driver.sendCommand(ZiGateCommandCode.SetTXpower, {value: this.adapterOptions.transmitPower});
         }
 
-        return startResult; // 'resumed' | 'reset' | 'restored'
+        return result;
     }
 
     public async stop(): Promise<void> {
         this.closing = true;
         await this.driver.close();
+    }
+
+    /**
+     * Check the network status on the adapter (execute the necessary pre-steps to be able to get it).
+     * WARNING: This is a one-off. Should not be called outside of `initNetwork`.
+     */
+    protected async initHasNetwork(): Promise<[true, panID: number, extendedPanID: Buffer] | [false, panID: undefined, extendedPanID: undefined]> {
+        const resetResponse = await this.driver.sendCommand(ZiGateCommandCode.Reset, {}, 5000);
+
+        if (resetResponse.code === ZiGateMessageCode.RestartNonFactoryNew) {
+            const result = await this.driver.sendCommand(ZiGateCommandCode.GetNetworkState, {}, 10000);
+            const extPanId = result.payload.ExtPANID as number;
+            const extPanIdBuf = Buffer.from(extPanId.toString(16), 'hex');
+
+            return [true, result.payload.PANID as number, extPanIdBuf];
+        }
+
+        return [false, undefined, undefined];
+    }
+
+    public async leaveNetwork(): Promise<void> {
+        await this.driver.sendCommand(ZiGateCommandCode.ErasePersistentData, {}, 5000);
+        // will be ZiGateMessageCode.RestartFactoryNew when here
+    }
+
+    public async formNetwork(backup?: Models.Backup): Promise<void> {
+        if (backup) {
+            // this path should never be reached
+            throw new Error('This adapter does not support backup');
+        } else {
+            await this.driver.sendCommand(ZiGateCommandCode.SetDeviceType, {deviceType: DEVICE_TYPE.coordinator});
+            await this.driver.sendCommand(ZiGateCommandCode.SetChannelMask, {
+                channelMask: ZSpec.Utils.channelsToUInt32Mask(this.networkOptions.channelList),
+            });
+            await this.driver.sendCommand(ZiGateCommandCode.SetSecurityStateKey, {
+                keyType: this.networkOptions.networkKeyDistribute
+                    ? ZPSNwkKeyState.ZPS_ZDO_DISTRIBUTED_LINK_KEY
+                    : ZPSNwkKeyState.ZPS_ZDO_PRECONFIGURED_LINK_KEY,
+                key: this.networkOptions.networkKey,
+            });
+            logger.debug(`Set EPanID ${this.networkOptions.extendedPanID.toString()}`, NS);
+            await this.driver.sendCommand(ZiGateCommandCode.SetExtendedPANID, {panId: this.networkOptions.extendedPanID});
+            await this.driver.sendCommand(ZiGateCommandCode.StartNetwork, {});
+        }
+    }
+
+    public async getNetworkKey(): Promise<Buffer> {
+        // TODO: doesn't look like zigate has any way to retrieve network key...
+        // force 'always assume matching'
+        return Buffer.from(this.networkOptions.networkKey);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public checkBackup(backup: Models.Backup): void {
+        // always fail if found a backup, since not supported, it can't be for zigate
+        throw new Error('This adapter does not support backup');
     }
 
     public async getCoordinatorIEEE(): Promise<string> {
@@ -469,36 +512,6 @@ export class ZiGateAdapter extends Adapter {
             await this.driver.sendCommand(ZiGateCommandCode.RawAPSDataRequest, payload, undefined, {}, true);
             await wait(200);
         });
-    }
-
-    /**
-     * Supplementary functions
-     */
-    private async initNetwork(): Promise<void> {
-        logger.debug(`Set channel mask ${this.networkOptions.channelList} key`, NS);
-        await this.driver.sendCommand(ZiGateCommandCode.SetChannelMask, {
-            channelMask: ZSpec.Utils.channelsToUInt32Mask(this.networkOptions.channelList),
-        });
-
-        logger.debug(`Set security key`, NS);
-        await this.driver.sendCommand(ZiGateCommandCode.SetSecurityStateKey, {
-            keyType: this.networkOptions.networkKeyDistribute
-                ? ZPSNwkKeyState.ZPS_ZDO_DISTRIBUTED_LINK_KEY
-                : ZPSNwkKeyState.ZPS_ZDO_PRECONFIGURED_LINK_KEY,
-            key: this.networkOptions.networkKey,
-        });
-
-        try {
-            // The block is wrapped in trapping because if the network is already created, the firmware does not accept the new key.
-            logger.debug(`Set EPanID ${this.networkOptions.extendedPanID!.toString()}`, NS);
-            await this.driver.sendCommand(ZiGateCommandCode.SetExtendedPANID, {
-                panId: this.networkOptions.extendedPanID,
-            });
-
-            await this.driver.sendCommand(ZiGateCommandCode.StartNetwork, {});
-        } catch (error) {
-            logger.error((error as Error).stack!, NS);
-        }
     }
 
     public waitFor(

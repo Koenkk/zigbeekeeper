@@ -3,6 +3,7 @@
 import assert from 'node:assert';
 
 import {Adapter, TsType} from '../..';
+import * as Models from '../../../models';
 import {Backup} from '../../../models';
 import {Queue, Waitress} from '../../../utils';
 import {logger} from '../../../utils/logger';
@@ -12,7 +13,7 @@ import * as Zdo from '../../../zspec/zdo';
 import * as ZdoTypes from '../../../zspec/zdo/definition/tstypes';
 import {ZclPayload} from '../../events';
 import {ZBOSSDriver} from '../driver';
-import {CommandId, DeviceUpdateStatus} from '../enums';
+import {CommandId, DeviceType, DeviceUpdateStatus, PolicyType, ResetOptions} from '../enums';
 import {FrameType, ZBOSSFrame} from '../frame';
 
 const NS = 'zh:zboss';
@@ -25,10 +26,22 @@ interface WaitressMatcher {
     commandIdentifier: number;
 }
 
+export type ZBOSSNetworkInfo = {
+    joined: boolean;
+    nodeType: DeviceType;
+    ieeeAddr: string;
+    network: {
+        panID: number;
+        extendedPanID: number[];
+        channel: number;
+    };
+};
+
 export class ZBOSSAdapter extends Adapter {
     private queue: Queue;
     private readonly driver: ZBOSSDriver;
     private waitress: Waitress<ZclPayload, WaitressMatcher>;
+    public netInfo!: ZBOSSNetworkInfo; // expected valid upon startup of driver
 
     constructor(
         networkOptions: TsType.NetworkOptions,
@@ -44,7 +57,7 @@ export class ZBOSSAdapter extends Adapter {
         this.queue = new Queue(concurrent);
 
         this.waitress = new Waitress<ZclPayload, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
-        this.driver = new ZBOSSDriver(serialPortOptions, networkOptions);
+        this.driver = new ZBOSSDriver(serialPortOptions);
         this.driver.on('frame', this.processMessage.bind(this));
     }
 
@@ -107,7 +120,46 @@ export class ZBOSSAdapter extends Adapter {
 
         await this.driver.connect();
 
-        return await this.driver.startup(this.adapterOptions.transmitPower);
+        const result = await this.initNetwork();
+
+        if (result === 'resumed') {
+            await this.driver.execCommand(CommandId.NWK_START_WITHOUT_FORMATION, {});
+        }
+
+        await this.driver.execCommand(CommandId.SET_TC_POLICY, {type: PolicyType.LINK_KEY_REQUIRED, value: 0});
+        await this.driver.execCommand(CommandId.SET_TC_POLICY, {type: PolicyType.IC_REQUIRED, value: 0});
+        await this.driver.execCommand(CommandId.SET_TC_POLICY, {type: PolicyType.TC_REJOIN_ENABLED, value: 1});
+        await this.driver.execCommand(CommandId.SET_TC_POLICY, {type: PolicyType.IGNORE_TC_REJOIN, value: 0});
+        await this.driver.execCommand(CommandId.SET_TC_POLICY, {type: PolicyType.APS_INSECURE_JOIN, value: 0});
+        await this.driver.execCommand(CommandId.SET_TC_POLICY, {type: PolicyType.DISABLE_NWK_MGMT_CHANNEL_UPDATE, value: 0});
+
+        // TODO: use ZSpec.XYZ and Zcl.Cluster.xyz.ID
+        await this.driver.addEndpoint(
+            1,
+            260,
+            0xbeef,
+            [0x0000, 0x0003, 0x0006, 0x000a, 0x0019, 0x001a, 0x0300],
+            [
+                0x0000, 0x0003, 0x0004, 0x0005, 0x0006, 0x0008, 0x0020, 0x0300, 0x0400, 0x0402, 0x0405, 0x0406, 0x0500, 0x0b01, 0x0b03, 0x0b04,
+                0x0702, 0x1000, 0xfc01, 0xfc02,
+            ],
+        );
+        await this.driver.addEndpoint(242, 0xa1e0, 0x61, [], [0x0021]);
+
+        // update cache after finished with network init stuff
+        this.netInfo = await this.driver.getNetworkInfo();
+
+        logger.debug(() => `Network Ready! ${JSON.stringify(this.netInfo)}`, NS);
+
+        await this.driver.execCommand(CommandId.SET_RX_ON_WHEN_IDLE, {rxOn: 1});
+        //await this.driver.execCommand(CommandId.SET_ED_TIMEOUT, {timeout: 8});
+        //await this.driver.execCommand(CommandId.SET_MAX_CHILDREN, {children: 100});
+
+        if (this.adapterOptions.transmitPower != undefined) {
+            await this.driver.execCommand(CommandId.SET_TX_POWER, {txPower: this.adapterOptions.transmitPower});
+        }
+
+        return result;
     }
 
     public async stop(): Promise<void> {
@@ -116,8 +168,74 @@ export class ZBOSSAdapter extends Adapter {
         logger.info(`ZBOSS Adapter stopped`, NS);
     }
 
+    /**
+     * Check the network status on the adapter (execute the necessary pre-steps to be able to get it).
+     * WARNING: This is a one-off. Should not be called outside of `initNetwork`.
+     */
+    protected async initHasNetwork(): Promise<[true, panID: number, extendedPanID: Buffer] | [false, panID: undefined, extendedPanID: undefined]> {
+        this.netInfo = await this.driver.getNetworkInfo();
+
+        if (this.netInfo?.joined) {
+            // force forming in case current network is `ROUTER` type
+            if (this.netInfo.nodeType !== DeviceType.COORDINATOR) {
+                return [false, undefined, undefined];
+            }
+
+            logger.debug(() => `Current network parameters: ${JSON.stringify(this.netInfo)}`, NS);
+
+            return [true, this.netInfo.network.panID, Buffer.from(this.netInfo.network.extendedPanID)];
+        }
+
+        return [false, undefined, undefined];
+    }
+
+    public async leaveNetwork(): Promise<void> {
+        // TODO: might have other side-effects than just leaving network?
+        await this.driver.reset(ResetOptions.FactoryReset);
+    }
+
+    /**
+     * If backup is defined, form network from backup, otherwise from config.
+     */
+    public async formNetwork(backup?: Models.Backup): Promise<void> {
+        if (backup) {
+            // this path should never be reached
+            throw new Error('This adapter does not support backup');
+        } else {
+            const channelMask = ZSpec.Utils.channelsToUInt32Mask(this.networkOptions.channelList);
+
+            await this.driver.execCommand(CommandId.SET_ZIGBEE_ROLE, {role: DeviceType.COORDINATOR});
+            await this.driver.execCommand(CommandId.SET_ZIGBEE_CHANNEL_MASK, {page: 0, mask: channelMask});
+            await this.driver.execCommand(CommandId.SET_PAN_ID, {panID: this.networkOptions.panID});
+            // await this.driver.execCommand(CommandId.SET_EXTENDED_PAN_ID, {extendedPanID: this.networkOptions.extendedPanID});
+            await this.driver.execCommand(CommandId.SET_NWK_KEY, {nwkKey: this.networkOptions.networkKey, index: 0});
+
+            const res = await this.driver.execCommand(
+                CommandId.NWK_FORMATION,
+                {
+                    len: 1,
+                    channels: [{page: 0, mask: channelMask}],
+                    duration: 0x05,
+                    distribFlag: 0x00,
+                    distribNwk: 0x0000,
+                    extendedPanID: this.networkOptions.extendedPanID,
+                },
+                20000,
+            );
+
+            logger.debug(() => `Forming network: ${JSON.stringify(res)}`, NS);
+        }
+    }
+
+    public async getNetworkKey(): Promise<Buffer> {
+        const res = await this.driver.execCommand(CommandId.GET_NWK_KEYS);
+
+        // XXX: assumed typed from CommandId.SET_NWK_KEY above
+        return Buffer.from(res.payload.nwkKey1 as number[]);
+    }
+
     public async getCoordinatorIEEE(): Promise<string> {
-        return this.driver.netInfo.ieeeAddr;
+        return this.netInfo.ieeeAddr;
     }
 
     public async getCoordinatorVersion(): Promise<TsType.CoordinatorVersion> {
@@ -153,15 +271,22 @@ export class ZBOSSAdapter extends Adapter {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public checkBackup(backup: Models.Backup): void {
+        // always fail if found a backup, since not supported, it can't be for zboss
+        throw new Error('This adapter does not support backup');
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     public async backup(ieeeAddressesInDatabase: string[]): Promise<Backup> {
         throw new Error('This adapter does not support backup');
     }
 
     public async getNetworkParameters(): Promise<TsType.NetworkParameters> {
         return await this.queue.execute<TsType.NetworkParameters>(async () => {
-            const channel = this.driver.netInfo!.network.channel;
-            const panID = this.driver.netInfo!.network.panID!;
-            const extendedPanID = this.driver.netInfo!.network.extendedPanID;
+            // TODO: this will not be up-to-date if channel changed by controller on start, need cache refresh mechanism
+            const channel = this.netInfo.network.channel;
+            const panID = this.netInfo.network.panID;
+            const extendedPanID = this.netInfo.network.extendedPanID;
 
             return {
                 panID,
@@ -318,7 +443,7 @@ export class ZBOSSAdapter extends Adapter {
         assocRestore: {ieeeadr: string; nwkaddr: number; noderelation: number} | null,
     ): Promise<ZclPayload | void> {
         if (ieeeAddr == null) {
-            ieeeAddr = this.driver.netInfo.ieeeAddr;
+            ieeeAddr = this.netInfo.ieeeAddr;
         }
         logger.debug(
             `sendZclFrameToEndpointInternal ${ieeeAddr}:${networkAddress}/${endpoint} ` +

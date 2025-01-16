@@ -6,6 +6,7 @@ import {wait} from '../../../utils';
 import {logger} from '../../../utils/logger';
 import * as ZSpec from '../../../zspec';
 import * as Zdo from '../../../zspec/zdo';
+import {StartResult} from '../../tstype';
 import * as ZnpConstants from '../constants';
 import {DevStates, NvItemsIds, ZnpCommandStatus} from '../constants/common';
 import {StartupOptions} from '../models/startup-options';
@@ -23,11 +24,6 @@ import {ZStackAdapter} from './zStackAdapter';
 const NS = 'zh:adapter:zstack:manager';
 
 /**
- * Startup strategy is internally used to determine required startup method.
- */
-type StartupStrategy = 'startup' | 'restoreBackup' | 'startCommissioning';
-
-/**
  * ZNP Adapter Manager is responsible for handling adapter startup, network commissioning,
  * configuration backup and restore.
  */
@@ -38,8 +34,7 @@ export class ZnpAdapterManager {
     private znp: Znp;
     private adapter: ZStackAdapter;
     private options: StartupOptions;
-    // @ts-expect-error initialized in `start()`
-    private nwkOptions: Models.NetworkOptions;
+    private nwkOptions!: Models.NetworkOptions;
 
     public constructor(adapter: ZStackAdapter, znp: Znp, options: StartupOptions) {
         this.znp = znp;
@@ -49,229 +44,71 @@ export class ZnpAdapterManager {
         this.backup = new AdapterBackup(this.znp, this.nv, this.options.backupPath);
     }
 
-    /**
-     * Performs ZNP adapter startup. After this method returns the adapter is configured, endpoints are registered
-     * and network is ready to process frames.
-     */
-    public async start(): Promise<TsType.StartResult> {
+    public async initHasNetwork(): Promise<[true, panID: number, extendedPanID: Buffer] | [false, panID: undefined, extendedPanID: undefined]> {
         logger.debug(`beginning znp startup`, NS);
         this.nwkOptions = await this.parseConfigNetworkOptions(this.options.networkOptions);
         await this.nv.init();
-
-        /* determine startup strategy */
-        const strategy = await this.determineStrategy();
-        logger.debug(`determined startup strategy: ${strategy}`, NS);
-
-        /* perform coordinator startup based on determined strategy */
-        let result: TsType.StartResult;
-        switch (strategy) {
-            case 'startup': {
-                await this.beginStartup();
-                result = 'resumed';
-                break;
-            }
-            case 'restoreBackup': {
-                if (this.options.version === ZnpVersion.zStack12) {
-                    logger.debug(`performing recommissioning instead of restore for z-stack 1.2`, NS);
-                    await this.beginCommissioning(this.nwkOptions);
-                    await this.beginStartup();
-                } else {
-                    await this.beginRestore();
-                }
-                result = 'restored';
-                break;
-            }
-            case 'startCommissioning': {
-                if (this.options.version === ZnpVersion.zStack12) {
-                    const hasConfigured = await this.nv.readItem(NvItemsIds.ZNP_HAS_CONFIGURED_ZSTACK1, 0, Structs.hasConfigured);
-                    await this.beginCommissioning(this.nwkOptions);
-                    await this.beginStartup();
-                    result = hasConfigured && hasConfigured.isConfigured() ? 'reset' : 'restored';
-                } else {
-                    await this.beginCommissioning(this.nwkOptions);
-                    result = 'reset';
-                }
-                break;
-            }
-        }
-
-        /* register endpoints */
-        await this.registerEndpoints();
-
-        /* add green power group */
-        await this.addToGroup(242, this.options.greenPowerGroup);
-
-        return result;
-    }
-
-    /**
-     * Internal function to determine startup strategy. The strategy determination flow is described in
-     * [this GitHub issue comment](https://github.com/Koenkk/zigbee-herdsman/issues/286#issuecomment-761029689).
-     */
-    private async determineStrategy(): Promise<StartupStrategy> {
-        logger.debug('determining znp startup strategy', NS);
 
         /* acquire data from adapter */
         const hasConfiguredNvId =
             this.options.version === ZnpVersion.zStack12 ? NvItemsIds.ZNP_HAS_CONFIGURED_ZSTACK1 : NvItemsIds.ZNP_HAS_CONFIGURED_ZSTACK3;
         const hasConfigured = await this.nv.readItem(hasConfiguredNvId, 0, Structs.hasConfigured);
-        const nib = await this.nv.readItem(NvItemsIds.NIB, 0, Structs.nib);
+
+        if (hasConfigured && hasConfigured.isConfigured()) {
+            const nib = await this.nv.readItem(NvItemsIds.NIB, 0, Structs.nib);
+
+            if (nib) {
+                return [true, nib.nwkPanId, nib.extendedPANID];
+            }
+        }
+
+        return [false, undefined, undefined];
+    }
+
+    public async resume(): Promise<void> {
+        await this.beginStartup();
+    }
+
+    public async restore(backup: Models.Backup): Promise<void> {
+        if (this.options.version === ZnpVersion.zStack12) {
+            logger.debug(`performing recommissioning instead of restore for z-stack 1.2`, NS);
+            await this.leaveNetwork();
+            await this.beginCommissioning(this.nwkOptions);
+            await this.beginStartup();
+        } else {
+            await this.beginRestore(backup);
+        }
+    }
+
+    public async reset(): Promise<StartResult | void> {
+        if (this.options.version === ZnpVersion.zStack12) {
+            const hasConfigured = await this.nv.readItem(NvItemsIds.ZNP_HAS_CONFIGURED_ZSTACK1, 0, Structs.hasConfigured);
+            await this.leaveNetwork();
+            await this.beginCommissioning(this.nwkOptions);
+            await this.beginStartup();
+
+            // XXX: forces to return `StartResult | void` from `adapter.formNetwork` (used for zstack only)
+            return hasConfigured && hasConfigured.isConfigured() ? 'reset' : 'restored';
+        } else {
+            await this.beginCommissioning(this.nwkOptions);
+        }
+    }
+
+    public async getNetworkKey(): Promise<Buffer> {
         const preconfiguredKey =
             this.options.version === ZnpVersion.zStack12
                 ? Structs.nwkKey(
                       (await this.znp.requestWithReply(Subsystem.SAPI, 'readConfiguration', {configid: NvItemsIds.PRECFGKEY})).payload.value,
                   )
                 : await this.nv.readItem(NvItemsIds.PRECFGKEY, 0, Structs.nwkKey);
-        let activeKeyInfo = await this.nv.readItem(NvItemsIds.NWK_ACTIVE_KEY_INFO, 0, Structs.nwkKeyDescriptor);
-        let alternateKeyInfo = await this.nv.readItem(NvItemsIds.NWK_ALTERN_KEY_INFO, 0, Structs.nwkKeyDescriptor);
 
-        /* Z-Stack 1.2 does not provide key info entries */
-        if (this.options.version === ZnpVersion.zStack12) {
-            activeKeyInfo = Structs.nwkKeyDescriptor();
-            activeKeyInfo.key = Buffer.from(preconfiguredKey.key);
-            alternateKeyInfo = Structs.nwkKeyDescriptor();
-            alternateKeyInfo.key = Buffer.from(preconfiguredKey.key);
-        }
+        return Buffer.from(preconfiguredKey.key);
+    }
 
-        /* get backup if available and supported by target */
-        const backup = await this.backup.getStoredBackup();
-
-        /* special treatment for incorrectly reversed Extended PAN IDs from previous releases */
-        const isExtendedPanIdReversed = nib && this.nwkOptions.extendedPanId.equals(Buffer.from(nib.extendedPANID).reverse());
-
-        const configMatchesAdapter =
-            nib &&
-            // Don't check for channel anymore because channel change is supported.
-            // Utils.compareChannelLists(this.nwkOptions.channelList, nib.channelList) &&
-            this.nwkOptions.panId === nib.nwkPanId &&
-            (this.nwkOptions.extendedPanId.equals(nib.extendedPANID) ||
-                /* exception for migration from previous code-base */
-                /* v8 ignore next */
-                isExtendedPanIdReversed ||
-                /* exception for some adapters which may actually use 0xdddddddddddddddd as EPID (backward compatibility) */
-                /* v8 ignore next */
-                this.nwkOptions.hasDefaultExtendedPanId) &&
-            this.nwkOptions.networkKey.equals(preconfiguredKey.key) &&
-            this.nwkOptions.networkKey.equals(activeKeyInfo.key) &&
-            this.nwkOptions.networkKey.equals(alternateKeyInfo.key);
-
-        const backupMatchesAdapter =
-            backup &&
-            nib &&
-            backup.networkOptions.panId === nib.nwkPanId &&
-            backup.networkOptions.extendedPanId.equals(nib.extendedPANID) &&
-            Utils.compareChannelLists(backup.networkOptions.channelList, nib.channelList) &&
-            backup.networkOptions.networkKey.equals(activeKeyInfo.key);
-
-        const configMatchesBackup = backup && Utils.compareNetworkOptions(this.nwkOptions, backup.networkOptions, true);
-
-        const checkRestoreVersionCompatibility = (): void => {
-            if (
-                this.options.version === ZnpVersion.zStack12 &&
-                backup &&
-                backup.znp?.version !== undefined &&
-                backup.znp.version !== ZnpVersion.zStack12
-            ) {
-                throw new Error(
-                    `your backup is from newer platform version (Z-Stack 3.0.x+) and cannot be restored onto Z-Stack 1.2 adapter - please remove backup before proceeding`,
-                );
-            }
-        };
-
-        /* Determine startup strategy */
-        if (!hasConfigured || !hasConfigured.isConfigured() || !nib) {
-            /* Adapter is not configured or not commissioned */
-            logger.debug('(stage-1) adapter is not configured / not commissioned', NS);
-            if (configMatchesBackup) {
-                /* Adapter backup is available and matches configuration */
-                logger.debug('(stage-2) configuration matches backup', NS);
-                checkRestoreVersionCompatibility();
-                return 'restoreBackup';
-            } else {
-                /* Adapter backup is either not available or does not match configuration */
-                if (!backup) {
-                    logger.debug('(stage-2) adapter backup does not exist', NS);
-                } else {
-                    logger.debug('(stage-2) configuration does not match backup', NS);
-                }
-                return 'startCommissioning';
-            }
-        } else {
-            /* Adapter is configured and commissioned */
-            logger.debug('(stage-1) adapter is configured', NS);
-
-            if (configMatchesAdapter) {
-                /* Warn if EPID is reversed (backward-compat) */
-                if (isExtendedPanIdReversed) {
-                    logger.debug('(stage-2) extended pan id is reversed', NS);
-                    logger.warning(
-                        `Extended PAN ID is reversed (expected=${this.nwkOptions.extendedPanId.toString('hex')}, actual=${nib.extendedPANID.toString('hex')})`,
-                        NS,
-                    );
-                }
-
-                /* Configuration matches adapter state - regular startup */
-                logger.debug('(stage-2) adapter state matches configuration', NS);
-                return 'startup';
-            } else {
-                /* Configuration does not match adapter state */
-                logger.debug('(stage-2) adapter state does not match configuration', NS);
-                if (backup) {
-                    /* Backup is present */
-                    logger.debug('(stage-3) got adapter backup', NS);
-                    if (backupMatchesAdapter) {
-                        /* Backup matches adapter state */
-                        logger.debug('(stage-4) adapter state matches backup', NS);
-                        logger.error(`Configuration is not consistent with adapter state/backup!`, NS);
-                        logger.error(`- PAN ID: configured=${this.nwkOptions.panId}, adapter=${nib.nwkPanId}`, NS);
-                        logger.error(
-                            `- Extended PAN ID: configured=${this.nwkOptions.extendedPanId.toString('hex')}, adapter=${nib.extendedPANID.toString('hex')}`,
-                            NS,
-                        );
-                        logger.error(
-                            `- Network Key: configured=${this.nwkOptions.networkKey.toString('hex')}, adapter=${activeKeyInfo.key.toString('hex')}`,
-                            NS,
-                        );
-                        logger.error(
-                            `- Channel List: configured=${this.nwkOptions.channelList.toString()}, adapter=${Utils.unpackChannelList(nib.channelList).toString()}`,
-                            NS,
-                        );
-                        logger.error(`Please update configuration to prevent further issues.`, NS);
-                        logger.error(
-                            `If you wish to re-commission your network, please remove coordinator backup at ${this.options.backupPath}.`,
-                            NS,
-                        );
-                        logger.error(`Re-commissioning your network will require re-pairing of all devices!`, NS);
-                        if (this.options.adapterOptions.forceStartWithInconsistentAdapterConfiguration) {
-                            logger.error(
-                                `Running despite adapter configuration mismatch as configured. Please update the adapter to compatible firmware and recreate your network as soon as possible.`,
-                                NS,
-                            );
-                            return 'startup';
-                        } else {
-                            throw new Error('startup failed - configuration-adapter mismatch - see logs above for more information');
-                        }
-                    } else {
-                        /* Backup does not match adapter state */
-                        logger.debug('(stage-4) adapter state does not match backup', NS);
-                        if (configMatchesBackup) {
-                            /* Adapter backup matches configuration */
-                            logger.debug('(stage-5) adapter backup matches configuration', NS);
-                            checkRestoreVersionCompatibility();
-                            return 'restoreBackup';
-                        } else {
-                            /* Adapter backup does not match configuration */
-                            logger.debug('(stage-5) adapter backup does not match configuration', NS);
-                            return 'startCommissioning';
-                        }
-                    }
-                } else {
-                    /* Configuration mismatches adapter and no backup is available */
-                    logger.debug('(stage-3) configuration-adapter mismatch (no backup)', NS);
-                    return 'startCommissioning';
-                }
-            }
-        }
+    public async leaveNetwork(): Promise<void> {
+        /* clear and reset the adapter */
+        await this.nv.deleteItem(NvItemsIds.NIB);
+        await this.clearAdapter();
     }
 
     /**
@@ -296,14 +133,7 @@ export class ZnpAdapterManager {
     /**
      * Internal method to perform adapter restore.
      */
-    private async beginRestore(): Promise<void> {
-        const backup = await this.backup.getStoredBackup();
-        /* v8 ignore start */
-        if (!backup) {
-            throw Error('Cannot restore backup - none is available');
-        }
-        /* v8 ignore stop */
-
+    private async beginRestore(backup: Models.Backup): Promise<void> {
         /* generate random provisioning network parameters */
         const provisioningNwkOptions: Models.NetworkOptions = {
             panId: 1 + Math.round(Math.random() * 65532),
@@ -312,6 +142,8 @@ export class ZnpAdapterManager {
             networkKey: crypto.randomBytes(16),
             networkKeyDistribute: false,
         };
+
+        await this.leaveNetwork();
 
         /* commission provisioning network */
         logger.debug('commissioning random provisioning network:', NS);
@@ -352,10 +184,6 @@ export class ZnpAdapterManager {
         if (nwkOptions.panId === 65535) {
             throw new Error(`network commissioning failed - cannot use pan id 65535`);
         }
-
-        /* clear and reset the adapter */
-        await this.nv.deleteItem(NvItemsIds.NIB);
-        await this.clearAdapter();
 
         /* commission the network as per parameters */
         await this.updateCommissioningNvItems(nwkOptions);
@@ -455,7 +283,7 @@ export class ZnpAdapterManager {
     /**
      * Registers endpoints before beginning normal operation.
      */
-    private async registerEndpoints(): Promise<void> {
+    public async registerEndpoints(): Promise<void> {
         const clusterId = Zdo.ClusterId.ACTIVE_ENDPOINTS_REQUEST;
         const zdoPayload = Zdo.Buffalo.buildRequest(this.adapter.hasZdoMessageOverhead, clusterId, ZSpec.COORDINATOR_ADDRESS);
         const response = await this.adapter.sendZdo(ZSpec.BLANK_EUI64, ZSpec.COORDINATOR_ADDRESS, clusterId, zdoPayload, false);
@@ -482,11 +310,12 @@ export class ZnpAdapterManager {
      * @param endpoint Endpoint index to add.
      * @param group Target group index.
      */
-    private async addToGroup(endpoint: number, group: number): Promise<void> {
+    public async addToGroup(endpoint: number, group: number): Promise<void> {
         const result = await this.znp.requestWithReply(5, 'extFindGroup', {endpoint, groupid: group}, undefined, undefined, [
             ZnpCommandStatus.SUCCESS,
             ZnpCommandStatus.FAILURE,
         ]);
+
         if (result.payload.status === ZnpCommandStatus.FAILURE) {
             await this.znp.request(5, 'extAddGroup', {endpoint, groupid: group, namelen: 0, groupname: []});
         }
