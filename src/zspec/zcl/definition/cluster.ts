@@ -4871,9 +4871,7 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
     sprutDevice: {
         ID: 26112,
         manufacturerCode: 26214,
-        attributes: {
-            debug: {ID: 0, type: DataType.BOOLEAN},
-        },
+        attributes: {},
         commands: {},
         commandsResponse: {},
     },
