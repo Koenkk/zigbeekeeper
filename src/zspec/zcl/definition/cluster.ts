@@ -4271,6 +4271,7 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
         ID: 0xfc01,
         manufacturerCode: ManufacturerCode.NIKO_NV,
         attributes: {
+            switchActionReporting: {ID: 0x0001, type: DataType.BITMAP8},
             switchAction: {ID: 0x0002, type: DataType.UINT8},
         },
         commands: {},
