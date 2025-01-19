@@ -74,4 +74,5 @@ export interface NetworkParameters {
     panID: number;
     extendedPanID: string; // `0x${string}` same as IEEE address
     channel: number;
+    nwkUpdateID?: number;
 }

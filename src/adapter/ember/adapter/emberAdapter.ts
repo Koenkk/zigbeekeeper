@@ -1678,6 +1678,7 @@ export class EmberAdapter extends Adapter {
                 panID,
                 extendedPanID: ZSpec.Utils.eui64LEBufferToHex(Buffer.from(extendedPanID)),
                 channel,
+                nwkUpdateID: this.networkCache.parameters.nwkUpdateId,
             };
         });
     }

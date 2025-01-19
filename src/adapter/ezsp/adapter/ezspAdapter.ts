@@ -462,6 +462,7 @@ export class EZSPAdapter extends Adapter {
             panID: this.driver.networkParams.panId,
             extendedPanID: ZSpec.Utils.eui64LEBufferToHex(this.driver.networkParams.extendedPanId),
             channel: this.driver.networkParams.radioChannel,
+            nwkUpdateID: this.driver.networkParams.nwkUpdateId,
         };
     }
 

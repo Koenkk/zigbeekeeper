@@ -2249,6 +2249,7 @@ describe('Ember Adapter Layer', () => {
                 panID: DEFAULT_NETWORK_OPTIONS.panID,
                 extendedPanID: ZSpec.Utils.eui64LEBufferToHex(Buffer.from(DEFAULT_NETWORK_OPTIONS.extendedPanID!)),
                 channel: DEFAULT_NETWORK_OPTIONS.channelList[0],
+                nwkUpdateID: 0,
             } as TsType.NetworkParameters);
             expect(mockEzspGetNetworkParameters).toHaveBeenCalledTimes(0);
         });
@@ -2260,6 +2261,7 @@ describe('Ember Adapter Layer', () => {
                 panID: DEFAULT_NETWORK_OPTIONS.panID,
                 extendedPanID: ZSpec.Utils.eui64LEBufferToHex(Buffer.from(DEFAULT_NETWORK_OPTIONS.extendedPanID!)),
                 channel: DEFAULT_NETWORK_OPTIONS.channelList[0],
+                nwkUpdateID: 0,
             } as TsType.NetworkParameters);
             expect(mockEzspGetNetworkParameters).toHaveBeenCalledTimes(1);
         });
